@@ -276,7 +276,19 @@ $("#goCombos").addEventListener("click", ()=>{ $("#q").value=""; query=""; setCa
 
 /* ===== Sacola e checkout ===== */
 const ENC = new Set(["cento-salgados","cento-doces","kit-festa","bolo-p","bolo-m","bolo-g"]);
-const TAXA_ENTREGA = null;            // null = "a combinar". Para cobrar fixo, troque por um número, ex.: 8
+/* ---------- Taxa de entrega por distância ---------- */
+// Endereço de saída das entregas (a loja, R. Amapá, 37)
+const LOJA = {lat:-23.4106626, lng:-46.8846252};
+// Faixas de distância pelo trajeto (km) e o valor da taxa. Ajuste à vontade.
+const FAIXAS_ENTREGA = [
+  {ate: 2,  taxa: 0},   // até 2 km: grátis
+  {ate: 4,  taxa: 4},
+  {ate: 6,  taxa: 6},
+  {ate: 8,  taxa: 8},
+  {ate: 10, taxa: 10},
+];                      // acima da última faixa: "a combinar" pelo WhatsApp
+const FRETE_GRATIS_ACIMA = null;  // ex.: 80 = pedidos a partir de R$ 80 não pagam entrega
+const FATOR_TRAJETO = 1.3;        // a linha reta é mais curta que o caminho pelas ruas
 const F = {mode:"Retirada na loja", when:"asap", pay:"Pix"};
 let step = "cart", orderId = null, lastMsg = "", lastLink = "#";
 // Nome e endereço ficam só neste aparelho, por no máximo 30 dias
@@ -285,7 +297,7 @@ let saved = {};
 try {
   const raw = JSON.parse(localStorage.getItem("mina-cliente") || "{}");
   if (raw && typeof raw === "object" && typeof raw.t === "number" && Date.now() - raw.t < KEEP_MS) {
-    ["name","street","number","district","ref"].forEach(k=>{ if (typeof raw[k] === "string") saved[k] = raw[k].slice(0, 140); });
+    ["name","cep","city","street","number","district","ref"].forEach(k=>{ if (typeof raw[k] === "string") saved[k] = raw[k].slice(0, 140); });
   } else localStorage.removeItem("mina-cliente");
 } catch(e){ saved = {}; }
 
@@ -297,7 +309,7 @@ const nowHM = () => { const d=new Date(); return `${pad(d.getHours())}:${pad(d.g
 const minDate = enc => { const d=new Date(); d.setDate(d.getDate() + (enc?2:0)); return isoOf(d); };
 const fmtDate = iso => { const [y,m,d]=iso.split("-"); return `${d}/${m}`; };
 // Entradas do cliente: sem caracteres de controle, sem marcação do WhatsApp (* _ ~ `) e com tamanho máximo
-const LIM = {name:80, street:120, number:12, district:80, ref:140, obs:500, change:12, date:10, time:5};
+const LIM = {name:80, cep:9, city:60, street:120, number:12, district:80, ref:140, obs:500, change:12, date:10, time:5};
 const cleanLine = (v, max) => String(v).replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g," ").replace(/[*_~`]/g,"").replace(/\s+/g," ").trim().slice(0, max);
 const cleanText = (v, max) => String(v).replace(/\r/g,"").replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g,"").replace(/[*_~`]/g,"").replace(/[ \t]+/g," ").replace(/\n{3,}/g,"\n\n").trim().slice(0, max);
 const val = id => (id==="obs" ? cleanText : cleanLine)($("#f-"+id).value, LIM[id] || 120);
@@ -309,8 +321,14 @@ function cartData(){
   const count = items.reduce((s,i)=>s+i.q,0);
   const subtotal = Math.round(items.reduce((s,i)=>s+i.sub,0)*100)/100;
   const hasEnc = items.some(i=>ENC.has(i.id));
-  const fee = F.mode==="Entrega" && typeof TAXA_ENTREGA==="number" ? TAXA_ENTREGA : 0;
-  return {items, count, subtotal, hasEnc, fee, total:Math.round((subtotal+fee)*100)/100};
+  let fee = 0, feeKnown = true, freeBy = false;
+  if (F.mode==="Entrega") {
+    if (DELIV.status==="ok") {
+      fee = DELIV.fee;
+      if (FRETE_GRATIS_ACIMA != null && subtotal >= FRETE_GRATIS_ACIMA && fee > 0) { fee = 0; freeBy = true; }
+    } else feeKnown = false;
+  }
+  return {items, count, subtotal, hasEnc, fee, feeKnown, freeBy, km:DELIV.km, deliv:DELIV.status, total:Math.round((subtotal+fee)*100)/100};
 }
 
 function add(id){
@@ -356,6 +374,144 @@ function refresh(){
   if (step==="info") syncForm();
 }
 
+/* Entrega: CEP, distância e taxa */
+const CEPINFO = {cep:"", uf:"", bad:""};
+let DELIV = {key:"", status:"idle", km:null, fee:null};
+const sleep = ms => new Promise(r=>setTimeout(r, ms));
+const fmtKm = km => km.toLocaleString("pt-BR",{minimumFractionDigits:1, maximumFractionDigits:1}) + " km";
+async function fetchJSON(url, ms){
+  const ctl = new AbortController(), t = setTimeout(()=>ctl.abort(), ms);
+  try {
+    const r = await fetch(url, {signal:ctl.signal, credentials:"omit", headers:{"Accept":"application/json"}});
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e) { return null; } finally { clearTimeout(t); }
+}
+function kmBetween(a, b){
+  const R = 6371, rad = x => x*Math.PI/180;
+  const dLat = rad(b.lat-a.lat), dLng = rad(b.lng-a.lng);
+  const h = Math.sin(dLat/2)**2 + Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLng/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+function feeForKm(km){ const f = FAIXAS_ENTREGA.find(x => km <= x.ate); return f ? f.taxa : null; }
+function feeLabel(o){
+  if (!o.feeKnown) return o.deliv==="far" && o.km!=null ? `a combinar (aprox. ${fmtKm(o.km)}, fora da tabela)` : "a combinar";
+  const km = o.km!=null ? ` (aprox. ${fmtKm(o.km)})` : "";
+  if (o.freeBy) return `grátis, pedido acima de ${brl(FRETE_GRATIS_ACIMA)}${km}`;
+  return (o.fee ? brl(o.fee) : "grátis") + km;
+}
+
+// Tabela visível para o cliente
+$("#feeTable").innerHTML = FAIXAS_ENTREGA.map((f,i)=>{
+  const de = i ? FAIXAS_ENTREGA[i-1].ate : 0;
+  return `<li><span>${de ? `De ${de} a ${f.ate} km` : `Até ${f.ate} km`}</span><span>${f.taxa ? brl(f.taxa) : "grátis"}</span></li>`;
+}).join("") + `<li><span>Acima de ${FAIXAS_ENTREGA[FAIXAS_ENTREGA.length-1].ate} km</span><span>a combinar</span></li>`
+  + (FRETE_GRATIS_ACIMA != null ? `<li><span>Pedidos a partir de ${brl(FRETE_GRATIS_ACIMA)}</span><span>grátis</span></li>` : "");
+
+// CEP: máscara + preenchimento automático (ViaCEP)
+let cepSeq = 0;
+$("#f-cep").addEventListener("input", e=>{
+  const d = e.target.value.replace(/\D/g,"").slice(0,8);
+  e.target.value = d.length > 5 ? d.slice(0,5)+"-"+d.slice(5) : d;
+  if (d.length === 8 && d !== CEPINFO.cep) lookupCEP(d);
+});
+["street","district","city"].forEach(k=>$("#f-"+k).addEventListener("input", e=>{ delete e.target.dataset.auto; }));
+async function lookupCEP(d){
+  const my = ++cepSeq;
+  $("#feeSub").textContent = "Buscando o CEP…";
+  const r = await fetchJSON(`https://viacep.com.br/ws/${d}/json/`, 6000);
+  if (my !== cepSeq) return;
+  CEPINFO.cep = d;
+  if (r && !r.erro && typeof r.localidade === "string") {
+    CEPINFO.bad = ""; CEPINFO.uf = cleanLine(r.uf || "", 2).toUpperCase();
+    const fill = (k, v) => { const el = $("#f-"+k), t = cleanLine(v || "", LIM[k]); if (t && (!el.value.trim() || el.dataset.auto)) { el.value = t; el.dataset.auto = "1"; setErr(k,""); } };
+    fill("street", r.logradouro); fill("district", r.bairro); fill("city", r.localidade);
+    setErr("cep","");
+    if (!val("number")) $("#f-number").focus({preventScroll:true});
+  } else if (r && r.erro) {
+    CEPINFO.bad = d; setErr("cep","CEP não encontrado. Confira os números.");
+  } else {
+    // sem internet ou serviço fora do ar: o cliente preenche à mão
+    CEPINFO.bad = "";
+  }
+  scheduleFee(0);
+}
+
+// Geocodificação (OpenStreetMap / Nominatim): no máximo 1 consulta por segundo, com cache
+const geoCache = new Map(); let lastGeo = 0;
+async function geocode(params){
+  const qs = new URLSearchParams({format:"jsonv2", limit:"1", countrycodes:"br", "accept-language":"pt-BR", ...params}).toString();
+  if (geoCache.has(qs)) return geoCache.get(qs);
+  const wait = 1100 - (Date.now() - lastGeo); if (wait > 0) await sleep(wait);
+  lastGeo = Date.now();
+  const r = await fetchJSON("https://nominatim.openstreetmap.org/search?" + qs, 8000);
+  let hit = null;
+  if (Array.isArray(r) && r[0]) { const lat = Number(r[0].lat), lng = Number(r[0].lon); if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) hit = {lat, lng}; }
+  if (r !== null) geoCache.set(qs, hit);   // não guarda falhas de rede
+  return hit;
+}
+
+let feeTimer = null, feeSeq = 0, feePromise = null;
+function addrKey(){ return [val("cep").replace(/\D/g,""), val("street"), val("number"), val("district"), val("city")].join("|").toLowerCase(); }
+function scheduleFee(ms){
+  clearTimeout(feeTimer);
+  if (F.mode !== "Entrega") return;
+  const k = addrKey();
+  if (k !== DELIV.key) { DELIV = {key:"", status:"idle", km:null, fee:null}; renderFee(); }
+  feeTimer = setTimeout(()=>{ computeFee(); }, ms ?? 900);
+}
+["cep","street","number","district","city"].forEach(k=>$("#f-"+k).addEventListener("input", ()=>scheduleFee()));
+
+function computeFee(){
+  clearTimeout(feeTimer);
+  const key = addrKey(), street = val("street"), number = val("number"), city = val("city"), district = val("district"), uf = CEPINFO.uf || "SP";
+  if (!street || !number || !city) { DELIV = {key:"", status:"idle", km:null, fee:null}; renderFee(); return Promise.resolve(); }
+  if (DELIV.key === key && DELIV.status !== "idle" && DELIV.status !== "loading") return Promise.resolve();
+  if (DELIV.key === key && DELIV.status === "loading" && feePromise) return feePromise;
+  const my = ++feeSeq;
+  DELIV = {key, status:"loading", km:null, fee:null}; renderFee();
+  feePromise = (async ()=>{
+    const tries = [
+      {street:`${number} ${street}`, city, state:uf, country:"Brasil"},
+      {street, city, state:uf, country:"Brasil"},
+      district ? {q:`${district}, ${city}, ${uf}, Brasil`} : null,
+    ].filter(Boolean);
+    let km = null, sawNetwork = false;
+    for (const t of tries) {
+      const p = await geocode(t);
+      if (my !== feeSeq) return;
+      if (!p) continue;
+      sawNetwork = true;
+      const straight = kmBetween(LOJA, p);
+      if (straight > 40) continue;            // achou um endereço com o mesmo nome em outra cidade
+      km = Math.round(straight * FATOR_TRAJETO * 10) / 10;
+      break;
+    }
+    if (my !== feeSeq) return;
+    if (km == null) DELIV = {key, status:"fail", km:null, fee:null};
+    else { const fee = feeForKm(km); DELIV = fee == null ? {key, status:"far", km, fee:null} : {key, status:"ok", km, fee}; }
+    renderFee(); refresh();
+  })();
+  return feePromise;
+}
+
+function renderFee(){
+  const box = $("#feeBox"); if (!box) return;
+  const d = cartData(), s = DELIV.status;
+  box.dataset.s = s;
+  const set = (icon, title, sub) => { $("#feeIcon").textContent = icon; $("#feeTitle").textContent = title; $("#feeSub").textContent = sub; };
+  if (s === "loading") set("⏳", "Calculando a taxa de entrega…", "Medindo a distância até a loja.");
+  else if (s === "ok") set("🛵", d.fee ? `Entrega: ${brl(d.fee)}` : "Entrega grátis", `Aprox. ${fmtKm(DELIV.km)} da loja${d.freeBy ? ` · grátis em pedidos a partir de ${brl(FRETE_GRATIS_ACIMA)}` : ""}.`);
+  else if (s === "far") set("📞", "Entrega a combinar", `Aprox. ${fmtKm(DELIV.km)} da loja, fora da nossa tabela. A equipe confirma pelo WhatsApp.`);
+  else if (s === "fail") set("📞", "Entrega a combinar", "Não conseguimos medir a distância desse endereço. A equipe confirma a taxa pelo WhatsApp.");
+  else set("📍", "Taxa de entrega", "Digite o CEP e o número para calcular.");
+  const foot = $("#feeFoot");
+  if (foot) {
+    foot.hidden = F.mode !== "Entrega" || (s !== "ok" && s !== "far" && s !== "fail");
+    foot.textContent = s === "ok" ? `+ entrega ${d.fee ? brl(d.fee) : "grátis"} · total ${brl(d.total)}` : "+ entrega a combinar";
+  }
+}
+
 /* Etapas */
 const ORDER = ["cart","info","review"];
 const TITLES = {cart:"Sua sacola", info:"Seus dados", review:"Revisar pedido", done:"Pedido pronto"};
@@ -374,9 +530,17 @@ function goStep(s){
 }
 $("#back").addEventListener("click", ()=>goStep(step==="review" ? "info" : "cart"));
 $("#toInfo").addEventListener("click", ()=>goStep("info"));
-$("#toReview").addEventListener("click", ()=>{ if (validate()) goStep("review"); });
+async function toReviewFlow(){
+  if (!validate()) return;
+  if (F.mode==="Entrega") {
+    const btn = $("#toReview"); btn.disabled = true; btn.textContent = "Calculando a entrega…";
+    try { await computeFee(); } finally { btn.disabled = false; btn.textContent = "Revisar pedido"; }
+  }
+  goStep("review");
+}
+$("#toReview").addEventListener("click", toReviewFlow);
 $("#editBack").addEventListener("click", ()=>goStep("info"));
-$("#pane-info").addEventListener("submit", e=>{ e.preventDefault(); if (validate()) goStep("review"); });
+$("#pane-info").addEventListener("submit", e=>{ e.preventDefault(); toReviewFlow(); });
 
 /* Formulário */
 let filled = false;
@@ -384,7 +548,8 @@ function syncForm(first){
   const d = cartData();
   if (first && !filled) {
     filled = true;
-    ["name","street","number","district","ref"].forEach(k=>{ if (saved[k] && !val(k)) $("#f-"+k).value = saved[k]; });
+    ["name","cep","city","street","number","district","ref"].forEach(k=>{ if (saved[k] && !val(k)) $("#f-"+k).value = saved[k]; });
+    if (saved.uf) CEPINFO.uf = saved.uf;
   }
   if (d.hasEnc) F.when = "sched";
   $("#when-asap").disabled = d.hasEnc;
@@ -399,11 +564,12 @@ function syncForm(first){
   $("#closedInfo").hidden = st.open || F.when !== "asap";
   if (!st.open) $("#closedInfo").innerHTML = `A loja está fechada agora. Pedidos para “o quanto antes” são preparados na abertura: <b>${st.when} às ${st.at}</b>.`;
   $("#encInfo").innerHTML = `Sua sacola tem itens de <b>encomenda</b>. Escolha uma data a partir de <b>${fmtDate(min)}</b>.`;
-  $("#feeHint").textContent = typeof TAXA_ENTREGA==="number" ? `Taxa de entrega: ${brl(TAXA_ENTREGA)}` : "A taxa de entrega é combinada pelo WhatsApp, conforme o bairro.";
+  renderFee();
+  if (first && F.mode==="Entrega") scheduleFee(0);
 }
 function pressed(sel, v){ document.querySelectorAll(sel+" button").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.v===v))); }
 [["#f-mode","mode"],["#f-when","when"],["#f-pay","pay"]].forEach(([sel,key])=>{
-  $(sel).addEventListener("click", e=>{ const b=e.target.closest("button"); if(!b || b.disabled) return; F[key]=b.dataset.v; syncForm(); });
+  $(sel).addEventListener("click", e=>{ const b=e.target.closest("button"); if(!b || b.disabled) return; F[key]=b.dataset.v; syncForm(); if (key==="mode" && F.mode==="Entrega") scheduleFee(0); });
 });
 document.querySelectorAll("#pane-info input, #pane-info textarea").forEach(i=>i.addEventListener("input", ()=>{ const id=i.id.slice(2); if ($("#e-"+id)) setErr(id,""); }));
 
@@ -418,10 +584,12 @@ function validate(){
   const chk = (id, msg) => { if (!setErr(id, msg)) bad.push(id); };
   chk("name", val("name").length < 2 ? "Digite seu nome para a gente identificar o pedido." : "");
   if (F.mode==="Entrega") {
+    chk("cep", val("cep").replace(/\D/g,"").length !== 8 ? "Informe o CEP com 8 números." : CEPINFO.bad === val("cep").replace(/\D/g,"") ? "CEP não encontrado. Confira os números." : "");
+    chk("city", val("city").length < 2 ? "Informe a cidade." : "");
     chk("street", val("street") ? "" : "Informe a rua.");
     chk("number", val("number") ? "" : "Informe o número.");
     chk("district", val("district") ? "" : "Informe o bairro.");
-  } else ["street","number","district"].forEach(i=>setErr(i,""));
+  } else ["cep","city","street","number","district"].forEach(i=>setErr(i,""));
   if (F.when==="sched") {
     const date = val("date"), t = val("time"), min = minDate(d.hasEnc);
     const hrs = date ? HOURS[new Date(date+"T12:00").getDay()] : null;
@@ -448,13 +616,15 @@ function buildOrder(){
     whenText = `${wd.charAt(0).toUpperCase()+wd.slice(1)}, ${fmtDate(val("date"))} às ${val("time").replace(":","h")}`;
   }
   const change = F.pay==="Dinheiro" && val("change") ? parseMoney(val("change")) : null;
+  const cepD = val("cep").replace(/\D/g,"");
   return {...d, id:orderId, name:val("name"), mode:F.mode, street:val("street"), number:val("number"), district:val("district"), ref:val("ref"),
+    city:val("city"), uf:CEPINFO.uf || "SP", cep: cepD.length===8 ? cepD.slice(0,5)+"-"+cepD.slice(5) : "",
     whenText, pay:F.pay, change, obs:val("obs"),
     created: now.toLocaleString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}).replace(",", " às")};
 }
 function buildMsg(o){
   // Só caracteres simples: emojis chegam como "?" em alguns celulares Android
-  const feeUnknown = o.mode==="Entrega" && typeof TAXA_ENTREGA!=="number";
+  const feeUnknown = o.mode==="Entrega" && !o.feeKnown;
   const SEP = "------------------------------";
   const L = [];
   L.push("*NOVO PEDIDO - MINACAPELLE*");
@@ -466,6 +636,7 @@ function buildMsg(o){
   L.push(`Recebimento: *${o.mode}*`);
   if (o.mode==="Entrega") {
     L.push(`Endereço: ${o.street}, ${o.number} - ${o.district}`);
+    L.push(`Cidade: ${o.city}/${o.uf}${o.cep ? " - CEP " + o.cep : ""}`);
     if (o.ref) L.push(`Referência: ${o.ref}`);
   }
   L.push(`Para: ${o.whenText}`);
@@ -478,7 +649,7 @@ function buildMsg(o){
   L.push(SEP);
   L.push(`Quantidade de itens: ${o.count}`);
   L.push(`Subtotal: ${brl(o.subtotal)}`);
-  if (o.mode==="Entrega") L.push(`Entrega: ${feeUnknown ? "a combinar" : brl(o.fee)}`);
+  if (o.mode==="Entrega") L.push(`Entrega: ${feeLabel(o)}`);
   L.push(`*TOTAL: ${brl(o.total)}${feeUnknown ? " + entrega" : ""}*`);
   L.push(SEP);
   L.push("*PAGAMENTO*");
@@ -493,12 +664,12 @@ function buildMsg(o){
 const waFormat = t => esc(t).replace(/\*([^*\n]+)\*/g,"<b>$1</b>").replace(/_([^_\n]+)_/g,"<i>$1</i>");
 
 function buildReview(){
-  const o = buildOrder(), feeUnknown = o.mode==="Entrega" && typeof TAXA_ENTREGA!=="number";
+  const o = buildOrder(), feeUnknown = o.mode==="Entrega" && !o.feeKnown;
   lastMsg = buildMsg(o);
   lastLink = `https://api.whatsapp.com/send?phone=${WHATSAPP}&text=${encodeURIComponent(lastMsg)}`;
   $("#send").href = lastLink; $("#sendAgain").href = lastLink;
   const rows = [["Cliente", o.name], ["Recebimento", o.mode]];
-  if (o.mode==="Entrega") rows.push(["Endereço", `${o.street}, ${o.number} · ${o.district}${o.ref ? " · "+o.ref : ""}`]);
+  if (o.mode==="Entrega") rows.push(["Endereço", `${o.street}, ${o.number} · ${o.district} · ${o.city}/${o.uf}${o.cep ? " · CEP "+o.cep : ""}${o.ref ? " · "+o.ref : ""}`]);
   rows.push(["Para", o.whenText], ["Pagamento", o.pay + (o.change ? ` · troco para ${brl(o.change)}` : "")]);
   if (o.obs) rows.push(["Observações", o.obs]);
   $("#pane-review").innerHTML = `
@@ -507,7 +678,7 @@ function buildReview(){
       ${o.items.map(i=>`<div class="rline"><span class="q">${i.q}x</span><span>${i.p.name}<small>${brl(i.p.price)} cada</small></span><span class="v">${brl(i.sub)}</span></div>`).join("")}
       <div class="rsep"></div>
       <div class="rrow"><span>Subtotal</span><span>${brl(o.subtotal)}</span></div>
-      ${o.mode==="Entrega" ? `<div class="rrow"><span>Entrega</span><span>${feeUnknown ? "a combinar" : brl(o.fee)}</span></div>` : ""}
+      ${o.mode==="Entrega" ? `<div class="rrow"><span>Entrega${o.km!=null ? ` <small style="color:var(--muted);font-weight:600">(aprox. ${fmtKm(o.km)})</small>` : ""}</span><span>${o.feeKnown ? (o.fee ? brl(o.fee) : "grátis") : "a combinar"}</span></div>` : ""}
       <div class="rtot"><span>Total${feeUnknown ? " + entrega" : ""}</span><span class="price">${brl(o.total)}</span></div>
     </div>
     <dl class="rdl">${rows.map(([k,v])=>`<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
@@ -531,7 +702,7 @@ function copyOrder(btn){
 $("#copyDone").addEventListener("click", e=>copyOrder(e.currentTarget));
 
 $("#send").addEventListener("click", ()=>{
-  try { localStorage.setItem("mina-cliente", JSON.stringify({name:val("name"), street:val("street"), number:val("number"), district:val("district"), ref:val("ref"), t:Date.now()})); } catch(e){}
+  try { localStorage.setItem("mina-cliente", JSON.stringify({name:val("name"), cep:val("cep"), city:val("city"), uf:CEPINFO.uf, street:val("street"), number:val("number"), district:val("district"), ref:val("ref"), t:Date.now()})); } catch(e){}
   $("#doneId").textContent = "#" + orderId;
   setTimeout(()=>goStep("done"), 350);
 });

@@ -375,7 +375,7 @@ img{max-width:100%}
 .hint{font-size:.78rem;color:var(--muted);font-weight:600}
 .group{display:grid;gap:12px;background:var(--cream-soft);border:2px dashed #D9C6A9;border-radius:16px;padding:12px}
 .row2{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px}
-.row2b{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+.row2b{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;align-items:start}
 .seg{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .chipset{display:flex;flex-wrap:wrap;gap:8px}
 .seg button,.chipset button{min-height:48px;padding:0 14px;border-radius:var(--pill);border:2px solid var(--ink);background:var(--white);font-weight:800;font-size:.9rem;transition:background var(--fast)}
@@ -408,6 +408,20 @@ img{max-width:100%}
 .done h4{font-family:var(--font-display);font-weight:400;font-size:2.4rem;line-height:1;text-transform:uppercase;margin:0}
 .done p{max-width:34ch;color:#3E2A20}
 .done .btn{width:100%;max-width:340px}
+.feebox{display:grid;grid-template-columns:42px minmax(0,1fr);gap:10px;align-items:center;background:var(--white);border:2px solid var(--ink);border-radius:14px;padding:10px 12px}
+.feebox .fi{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:var(--cream);border:2px solid var(--ink);font-size:1.15rem}
+.feebox[data-s="ok"] .fi{background:var(--mint)}
+.feebox[data-s="far"] .fi,.feebox[data-s="fail"] .fi{background:#FFF1C9}
+.feebox[data-s="loading"] .fi span{display:inline-block;animation:spin 1.2s linear infinite}
+.feebox b{display:block;font-weight:900;line-height:1.25}
+.feebox small{display:block;color:var(--muted);font-size:.78rem;font-weight:600;line-height:1.35}
+.fee-table{font-size:.82rem}
+.fee-table summary{cursor:pointer;font-weight:800;min-height:44px;display:flex;align-items:center;text-decoration:underline;text-underline-offset:3px;list-style:none}
+.fee-table summary::-webkit-details-marker{display:none}
+.fee-table ul{list-style:none;margin:0 0 8px;padding:0;display:grid;gap:4px}
+.fee-table li{display:flex;justify-content:space-between;gap:10px;background:var(--white);border:1.5px solid var(--line);border-radius:10px;padding:6px 10px;font-weight:700;font-variant-numeric:tabular-nums}
+.fee-table small{display:block;color:var(--muted);font-weight:600;line-height:1.4}
+.linkish{color:var(--ink);font-weight:700;font-size:.78rem;display:inline-flex;align-items:center;min-height:32px;justify-self:start}
 .drawer-foot{border-top:2.5px solid var(--ink);padding:14px 16px;display:grid;gap:10px;background:var(--cream-soft)}
 .drawer-foot>div{display:grid;gap:10px}
 .total{display:flex;justify-content:space-between;align-items:baseline;font-weight:900}
@@ -688,13 +702,18 @@ img{max-width:100%}
       <div class="seg" id="f-mode" role="group" aria-label="Recebimento"><button type="button" id="mode-ret" data-v="Retirada na loja" aria-pressed="true">🏪 Retirar na loja</button><button type="button" id="mode-ent" data-v="Entrega" aria-pressed="false">🛵 Entrega</button></div>
     </div>
     <div class="group" id="g-addr" hidden>
+      <div class="row2b">
+        <div class="field"><label for="f-cep">CEP</label><input id="f-cep" inputmode="numeric" autocomplete="postal-code" placeholder="00000-000"><span class="err" id="e-cep" hidden></span><a class="linkish" href="https://buscacepinter.correios.com.br/app/endereco/index.php" target="_blank" rel="noopener noreferrer">Não sei meu CEP</a></div>
+        <div class="field"><label for="f-city">Cidade</label><input id="f-city" autocomplete="address-level2" placeholder="Sua cidade"><span class="err" id="e-city" hidden></span></div>
+      </div>
       <div class="row2">
         <div class="field"><label for="f-street">Rua</label><input id="f-street" autocomplete="address-line1" placeholder="Nome da rua"><span class="err" id="e-street" hidden></span></div>
         <div class="field"><label for="f-number">Número</label><input id="f-number" inputmode="numeric" placeholder="123"><span class="err" id="e-number" hidden></span></div>
       </div>
       <div class="field"><label for="f-district">Bairro</label><input id="f-district" autocomplete="address-level3" placeholder="Seu bairro"><span class="err" id="e-district" hidden></span></div>
       <div class="field"><label for="f-ref">Complemento ou referência <small>(opcional)</small></label><input id="f-ref" placeholder="Apto, bloco, ponto de referência"></div>
-      <span class="hint" id="feeHint"></span>
+      <div class="feebox" id="feeBox" data-s="idle" aria-live="polite"><span class="fi" aria-hidden="true"><span id="feeIcon">📍</span></span><div><b id="feeTitle">Taxa de entrega</b><small id="feeSub">Digite o CEP e o número para calcular.</small></div></div>
+      <details class="fee-table"><summary>Ver tabela de entrega</summary><ul id="feeTable"></ul><small>A distância é aproximada, pelo trajeto até a loja. Para calcular, o CEP e o endereço são consultados no ViaCEP e no OpenStreetMap (© colaboradores do OpenStreetMap). A equipe confirma a taxa no WhatsApp.</small></details>
     </div>
     <div class="field"><span class="legend">Para quando?</span>
       <div class="seg" id="f-when" role="group" aria-label="Quando"><button type="button" id="when-asap" data-v="asap" aria-pressed="true">⚡ O quanto antes</button><button type="button" id="when-sched" data-v="sched" aria-pressed="false">📅 Agendar</button></div>
@@ -732,6 +751,7 @@ img{max-width:100%}
     </div>
     <div data-foot="info" hidden>
       <div class="total"><span>Subtotal</span><span class="price" id="subtotal2">R$ 0,00</span></div>
+      <span class="hint" id="feeFoot" hidden></span>
       <button class="btn btn-ink btn-block" id="toReview" type="button">Revisar pedido</button>
     </div>
     <div data-foot="review" hidden>
